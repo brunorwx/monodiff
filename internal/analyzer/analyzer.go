@@ -4,12 +4,11 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 
-	"github.com/brunorwx/monodiff/internal/graph"
 	"github.com/brunorwx/monodiff/internal/workspace"
 )
 
-// simple set type for convenience
 type StrSet map[string]struct{}
 
 func (s StrSet) Add(v string) { s[v] = struct{}{} }
@@ -26,39 +25,35 @@ func (s StrSet) List() []string {
 	return out
 }
 
-// MapFilesToPackages maps changed files to owning package(s) by longest-prefix path match
 func MapFilesToPackages(files []string, pkgs map[string]*workspace.Package) StrSet {
 	owned := StrSet{}
-	// Build list of package paths
+
 	type pinfo struct {
 		name string
 		path string
 	}
-	var pi []pinfo
+	pi := make([]pinfo, 0, len(pkgs))
 	for n, p := range pkgs {
 		pi = append(pi, pinfo{name: n, path: filepath.Clean(p.Path)})
 	}
-	// for each file, find the package with the longest path prefix match
+
 	for _, f := range files {
 		fclean := filepath.Clean(f)
 		best := ""
 		bestLen := -1
 		for _, p := range pi {
-			// if package path is "." or "", it owns everything at root
 			pth := p.path
 			if pth == "." || pth == "" {
-				pth = ""
-			}
-			if pth == "" {
-				// root package, match any file
+
 				if 0 > bestLen {
 					best = p.name
 					bestLen = 0
 				}
 				continue
 			}
-			// check prefix (path separators normalized)
-			if strings.HasPrefix(fclean, pth+string(filepath.Separator)) || fclean == pth {
+
+			pref := pth + string(filepath.Separator)
+			if fclean == pth || strings.HasPrefix(fclean, pref) {
 				if len(pth) > bestLen {
 					best = p.name
 					bestLen = len(pth)
@@ -72,37 +67,60 @@ func MapFilesToPackages(files []string, pkgs map[string]*workspace.Package) StrS
 	return owned
 }
 
-// ComputeImpact computes transitive dependents (reverse graph BFS)
 func ComputeImpact(pkgs map[string]*workspace.Package, changed StrSet) StrSet {
-	// build graph adjacency for local deps
-	g := graph.New()
-	local := map[string]bool{}
-	for n := range pkgs {
-		local[n] = true
+	n := len(pkgs)
+	// map names -> id
+	idOf := make(map[string]int, n)
+	names := make([]string, 0, n)
+	i := 0
+	for name := range pkgs {
+		idOf[name] = i
+		names = append(names, name)
+		i++
 	}
+
+	adj := make([][]int, n)
 	for name, p := range pkgs {
+		u := idOf[name]
 		for dep := range p.Dependencies {
-			if local[dep] {
-				g.AddEdge(name, dep) // name -> dep
+			if v, ok := idOf[dep]; ok {
+				adj[u] = append(adj[u], v)
 			}
 		}
 	}
-	rev := g.Reverse() // dep -> dependent
-	// BFS from changed nodes on reverse graph
-	result := StrSet{}
-	queue := []string{}
-	for n := range changed {
-		queue = append(queue, n)
-		result.Add(n)
+
+	rev := make([][]int, n)
+	for u := 0; u < n; u++ {
+		for _, v := range adj[u] {
+			rev[v] = append(rev[v], u)
+		}
 	}
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		for _, dep := range rev.Adj[cur] {
-			if !result.Has(dep) {
-				result.Add(dep)
+
+	visited := make([]uint32, n)
+	queue := make([]int, 0, len(changed))
+	for name := range changed {
+		if id, ok := idOf[name]; ok {
+			if atomic.CompareAndSwapUint32(&visited[id], 0, 1) {
+				queue = append(queue, id)
+			}
+		}
+	}
+
+	head := 0
+	for head < len(queue) {
+		cur := queue[head]
+		head++
+		for _, dep := range rev[cur] {
+			if atomic.CompareAndSwapUint32(&visited[dep], 0, 1) {
 				queue = append(queue, dep)
 			}
+		}
+	}
+
+	result := StrSet{}
+	for id, v := range visited {
+		if v == 1 {
+			result.Add(names[id])
 		}
 	}
 	return result

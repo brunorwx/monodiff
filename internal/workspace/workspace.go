@@ -1,43 +1,78 @@
 package workspace
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
-// Package represents a workspace package
 type Package struct {
 	Name         string            `json:"name"`
 	Path         string            `json:"path"` // relative to repo root
 	Dependencies map[string]string `json:"dependencies"`
 }
 
-// DiscoverPackages scans the repo root for package.json files and returns a map[name]*Package
 func DiscoverPackages(root string) (map[string]*Package, error) {
-	pkgs := map[string]*Package{}
-
+	var pkgJsonPaths []string
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+
 		if d.IsDir() {
-			// skip node_modules and .git
 			base := filepath.Base(path)
 			if base == "node_modules" || base == ".git" {
 				return filepath.SkipDir
 			}
 		}
 
-		if strings.EqualFold(filepath.Base(path), "package.json") {
+		if !d.IsDir() && strings.EqualFold(filepath.Base(path), "package.json") {
+
 			rel, _ := filepath.Rel(root, path)
-			dir := filepath.Dir(rel)
-			data, err := os.ReadFile(path)
+			pkgJsonPaths = append(pkgJsonPaths, rel)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := map[string]*Package{}
+	var mu sync.Mutex
+
+	maxWorkers := runtime.GOMAXPROCS(0)
+	if maxWorkers <= 0 {
+		maxWorkers = 4
+	}
+
+	const maxCap = 12
+	if maxWorkers > maxCap {
+		maxWorkers = maxCap
+	}
+
+	g, _ := errgroup.WithContext(context.Background())
+	sem := semaphore.NewWeighted(int64(maxWorkers))
+
+	for _, relPath := range pkgJsonPaths {
+		relPath := relPath // capture
+		if err := sem.Acquire(context.Background(), 1); err != nil {
+			return nil, err
+		}
+		g.Go(func() error {
+			defer sem.Release(1)
+			full := filepath.Join(root, relPath)
+			data, err := os.ReadFile(full)
 			if err != nil {
-				return err
+				return fmt.Errorf("read package.json %s: %w", full, err)
 			}
 			var pj struct {
 				Name         string            `json:"name"`
@@ -46,7 +81,7 @@ func DiscoverPackages(root string) (map[string]*Package, error) {
 				PeerDeps     map[string]string `json:"peerDependencies"`
 			}
 			if err := json.Unmarshal(data, &pj); err != nil {
-				return fmt.Errorf("invalid package.json at %s: %w", path, err)
+				return fmt.Errorf("invalid package.json at %s: %w", full, err)
 			}
 			deps := map[string]string{}
 			for k, v := range pj.Dependencies {
@@ -58,29 +93,39 @@ func DiscoverPackages(root string) (map[string]*Package, error) {
 			for k, v := range pj.PeerDeps {
 				deps[k] = v
 			}
+
+			dir := filepath.Dir(relPath)
+			if dir == "." {
+				dir = ""
+			}
 			name := pj.Name
 			if name == "" {
-				// fallback to path name
-				name = dir
+
+				if dir == "" {
+					name = filepath.Base(root)
+				} else {
+					name = filepath.Base(dir)
+				}
 			}
-			pkgs[name] = &Package{
+			mu.Lock()
+			out[name] = &Package{
 				Name:         name,
 				Path:         dir,
 				Dependencies: deps,
 			}
-		}
-		return nil
-	})
-	if err != nil {
+			mu.Unlock()
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	return pkgs, nil
+	return out, nil
 }
 
-// GraphAdjacency returns adjacency map for JSON output: package -> local deps (names)
 func GraphAdjacency(pkgs map[string]*Package) map[string][]string {
 	adj := map[string][]string{}
-	// build reverse map from dependency name -> isLocal
+
 	localNames := map[string]bool{}
 	for n := range pkgs {
 		localNames[n] = true
